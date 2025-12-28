@@ -117,8 +117,19 @@ __host__ void compress_and_get_metada(bfloat16_t *A_pruned, int M, int K, bfloat
     }
 }
 
-__global__ void simpleOneTensorGemm_GlobalMemAcc(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, int kernel_loops)
+__global__ void simpleOneTensorGemm_GlobalMemAcc(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, long long *d_cycles)
 {
+    __syncthreads();
+
+    asm volatile ("" ::: "memory"); 
+
+    long long start_clock = 0;
+    long long end_clock = 0;
+
+    if (threadIdx.x == 0) {
+        start_clock = clock64();
+    }
+
     // th 0,1 ; 4,5 ; 8,9 ; 12,13 ; 16,17 ; 20;21 ; 24,25 ; 28,29
     int idx = threadIdx.x;
 
@@ -136,57 +147,74 @@ __global__ void simpleOneTensorGemm_GlobalMemAcc(bfloat16_t *A_compressed, bfloa
     C_mat_regs[2] = 0.0f;
     C_mat_regs[3] = 0.0f;
 
-    for (int i = 0; i < kernel_loops; i++)
+    uint32_t raw_row_low  = Metadata[row_idx];      
+    uint32_t raw_row_high = Metadata[row_idx + 8];
+
+    if (col_idx == 0)
     {
-        uint32_t raw_row_low  = Metadata[row_idx];      
-        uint32_t raw_row_high = Metadata[row_idx + 8];
+        metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
+    }
+    else
+    {
+        metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
+    } 
 
-        if (col_idx == 0)
-        {
-            metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
-        }
-        else
-        {
-            metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
-        } 
+    bfloat16_t *thStartA = A_compressed + (idx % 4) *  2 + (idx / 4) * 16;
+    bfloat16_t *thStartB = B            + (idx % 4) * 16 + (idx / 4)     ;
+    float            *thStartC = C            + (idx % 4) *  2 + (idx / 4) *  8;
 
-        bfloat16_t *thStartA = A_compressed + (idx % 4) *  2 + (idx / 4) * 16;
-        bfloat16_t *thStartB = B            + (idx % 4) * 16 + (idx / 4)     ;
-        float            *thStartC = C            + (idx % 4) *  2 + (idx / 4) *  8;
+    A_mat_regs[0] = packbf16_2(thStartA[  1], thStartA[  0]);
+    A_mat_regs[1] = packbf16_2(thStartA[129], thStartA[128]);
+    A_mat_regs[2] = packbf16_2(thStartA[  9], thStartA[  8]);
+    A_mat_regs[3] = packbf16_2(thStartA[137], thStartA[136]);
 
-        A_mat_regs[0] = packbf16_2(thStartA[  1], thStartA[  0]);
-        A_mat_regs[1] = packbf16_2(thStartA[129], thStartA[128]);
-        A_mat_regs[2] = packbf16_2(thStartA[  9], thStartA[  8]);
-        A_mat_regs[3] = packbf16_2(thStartA[137], thStartA[136]);
+    B_mat_regs[0] = packbf16_2(thStartB[  8], thStartB[  0]);
+    B_mat_regs[1] = packbf16_2(thStartB[ 72], thStartB[ 64]);
+    B_mat_regs[2] = packbf16_2(thStartB[136], thStartB[128]);
+    B_mat_regs[3] = packbf16_2(thStartB[200], thStartB[192]);
 
-        B_mat_regs[0] = packbf16_2(thStartB[  8], thStartB[  0]);
-        B_mat_regs[1] = packbf16_2(thStartB[ 72], thStartB[ 64]);
-        B_mat_regs[2] = packbf16_2(thStartB[136], thStartB[128]);
-        B_mat_regs[3] = packbf16_2(thStartB[200], thStartB[192]);
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "      
+        "{%4, %5, %6, %7}, "      
+        "{%8, %9, %10, %11}, "    
+        "{%12, %13, %14, %15}, "  
+        "%16, 0x0;\n"             
+        : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
+        : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
+        "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
+        "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
+        "r"(metadata_reg)
+        );
 
-        asm volatile(
-            "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
-            "{%0, %1, %2, %3}, "      
-            "{%4, %5, %6, %7}, "      
-            "{%8, %9, %10, %11}, "    
-            "{%12, %13, %14, %15}, "  
-            "%16, 0x0;\n"             
-            : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
-            : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
-            "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
-            "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
-            "r"(metadata_reg)
-            );
+    thStartC[0] = C_mat_regs[0];
+    thStartC[1] = C_mat_regs[1];
+    thStartC[64] = C_mat_regs[2];
+    thStartC[65] = C_mat_regs[3];
 
-        thStartC[0] = C_mat_regs[0];
-        thStartC[1] = C_mat_regs[1];
-        thStartC[64] = C_mat_regs[2];
-        thStartC[65] = C_mat_regs[3];
+    asm volatile ("" ::: "memory");
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        end_clock = clock64();
+        *d_cycles = *d_cycles + (end_clock - start_clock);
     }
 }
 
-__global__ void simpleOneTensorGemm_SharedMemAcc(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, int kernel_loops)
+__global__ void simpleOneTensorGemm_SharedMemAcc(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, long long *d_cycles)
 {
+    __syncthreads();
+
+    asm volatile ("" ::: "memory"); 
+
+    long long start_clock = 0;
+    long long end_clock = 0;
+
+    if (threadIdx.x == 0) {
+        start_clock = clock64();
+    }
+
     // th 0,1 ; 4,5 ; 8,9 ; 12,13 ; 16,17 ; 20;21 ; 24,25 ; 28,29
     int idx = threadIdx.x;
 
@@ -207,62 +235,78 @@ __global__ void simpleOneTensorGemm_SharedMemAcc(bfloat16_t *A_compressed, bfloa
     __shared__ bfloat16_t smemA[256]; // M x K(compressed) ==> 16 X 16 = 256
     __shared__ bfloat16_t smemB[256]; // K x N             ==> 32 X  8 = 256
 
-    for (int i = 0; i < kernel_loops; i++)
+    *((uint4*)&smemA[idx * 8]) = *((uint4*)&A_compressed[idx * 8]);    // 128 bit vectorized copy
+    *((uint4*)&smemB[idx * 8]) = *((uint4*)&B[idx * 8]);               // 128 bit vectorized copy
+
+    uint32_t raw_row_low  = Metadata[row_idx];
+    uint32_t raw_row_high = Metadata[row_idx + 8];
+
+    if (col_idx == 0)
     {
-        *((uint4*)&smemA[idx * 8]) = *((uint4*)&A_compressed[idx * 8]);    // 128 bit vectorized copy
-        *((uint4*)&smemB[idx * 8]) = *((uint4*)&B[idx * 8]);               // 128 bit vectorized copy
+        metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
+    }
+    else
+    {
+        metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
+    }
 
-        uint32_t raw_row_low  = Metadata[row_idx];
-        uint32_t raw_row_high = Metadata[row_idx + 8];
+    __syncthreads();   // be sure all threads write the values smem
 
-        if (col_idx == 0)
-        {
-            metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
-        }
-        else
-        {
-            metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
-        }
+    bfloat16_t *thStartA = smemA + (idx % 4) *  2 + (idx / 4) * 16;
+    bfloat16_t *thStartB = smemB + (idx % 4) * 16 + (idx / 4);
+    float            *thStartC =     C + (idx % 4) *  2 + (idx / 4) * 8;
 
-        __syncthreads();   // be sure all threads write the values smem
+    A_mat_regs[0] = packbf16_2(thStartA[  1], thStartA[  0]);
+    A_mat_regs[1] = packbf16_2(thStartA[129], thStartA[128]);
+    A_mat_regs[2] = packbf16_2(thStartA[  9], thStartA[  8]);
+    A_mat_regs[3] = packbf16_2(thStartA[137], thStartA[136]);
 
-        bfloat16_t *thStartA = smemA + (idx % 4) *  2 + (idx / 4) * 16;
-        bfloat16_t *thStartB = smemB + (idx % 4) * 16 + (idx / 4);
-        float            *thStartC =     C + (idx % 4) *  2 + (idx / 4) * 8;
+    B_mat_regs[0] = packbf16_2(thStartB[  8], thStartB[  0]);
+    B_mat_regs[1] = packbf16_2(thStartB[ 72], thStartB[ 64]);
+    B_mat_regs[2] = packbf16_2(thStartB[136], thStartB[128]);
+    B_mat_regs[3] = packbf16_2(thStartB[200], thStartB[192]);
 
-        A_mat_regs[0] = packbf16_2(thStartA[  1], thStartA[  0]);
-        A_mat_regs[1] = packbf16_2(thStartA[129], thStartA[128]);
-        A_mat_regs[2] = packbf16_2(thStartA[  9], thStartA[  8]);
-        A_mat_regs[3] = packbf16_2(thStartA[137], thStartA[136]);
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "      
+        "{%4, %5, %6, %7}, "      
+        "{%8, %9, %10, %11}, "    
+        "{%12, %13, %14, %15}, "  
+        "%16, 0x0;\n"             
+        : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
+        : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
+        "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
+        "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
+        "r"(metadata_reg)
+        );
 
-        B_mat_regs[0] = packbf16_2(thStartB[  8], thStartB[  0]);
-        B_mat_regs[1] = packbf16_2(thStartB[ 72], thStartB[ 64]);
-        B_mat_regs[2] = packbf16_2(thStartB[136], thStartB[128]);
-        B_mat_regs[3] = packbf16_2(thStartB[200], thStartB[192]);
+    thStartC[0] = C_mat_regs[0];
+    thStartC[1] = C_mat_regs[1];
+    thStartC[64] = C_mat_regs[2];
+    thStartC[65] = C_mat_regs[3];
 
-        asm volatile(
-            "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
-            "{%0, %1, %2, %3}, "      
-            "{%4, %5, %6, %7}, "      
-            "{%8, %9, %10, %11}, "    
-            "{%12, %13, %14, %15}, "  
-            "%16, 0x0;\n"             
-            : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
-            : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
-            "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
-            "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
-            "r"(metadata_reg)
-            );
+    asm volatile ("" ::: "memory");
+    __syncthreads();
 
-        thStartC[0] = C_mat_regs[0];
-        thStartC[1] = C_mat_regs[1];
-        thStartC[64] = C_mat_regs[2];
-        thStartC[65] = C_mat_regs[3];
+    if (threadIdx.x == 0)
+    {
+        end_clock = clock64();
+        *d_cycles = *d_cycles + (end_clock - start_clock);
     }
 }
 
-__global__ void simpleOneTensorGemm_Wldmatrix(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, int kernel_loops)
+__global__ void simpleOneTensorGemm_Wldmatrix(bfloat16_t *A_compressed, bfloat16_t *B, float *C, int32_t *Metadata, long long *d_cycles)
 {
+    __syncthreads();
+
+    asm volatile ("" ::: "memory"); 
+
+    long long start_clock = 0;
+    long long end_clock = 0;
+
+    if (threadIdx.x == 0) {
+        start_clock = clock64();
+    }
     // th 0,1 ; 4,5 ; 8,9 ; 12,13 ; 16,17 ; 20;21 ; 24,25 ; 28,29
     int idx = threadIdx.x;
 
@@ -282,58 +326,64 @@ __global__ void simpleOneTensorGemm_Wldmatrix(bfloat16_t *A_compressed, bfloat16
     __shared__ bfloat16_t smemA[256];
     __shared__ bfloat16_t smemB[256]; 
 
-    for (int i = 0; i < kernel_loops; i++)
+    *((uint4*)&smemA[idx * 8]) = *((uint4*)&A_compressed[idx * 8]);    // 128 bit vectorized copy
+    *((uint4*)&smemB[idx * 8]) = *((uint4*)&B[idx * 8]);               // 128 bit vectorized copy
+
+    uint32_t raw_row_low  = Metadata[row_idx];      
+    uint32_t raw_row_high = Metadata[row_idx + 8];
+
+    if (col_idx == 0)
     {
-        *((uint4*)&smemA[idx * 8]) = *((uint4*)&A_compressed[idx * 8]);    // 128 bit vectorized copy
-        *((uint4*)&smemB[idx * 8]) = *((uint4*)&B[idx * 8]);               // 128 bit vectorized copy
+        metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
+    }
+    else
+    {
+        metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
+    } 
 
-        uint32_t raw_row_low  = Metadata[row_idx];      
-        uint32_t raw_row_high = Metadata[row_idx + 8];
+    __syncthreads();   // be sure all threads write the values smem
 
-        if (col_idx == 0)
-        {
-            metadata_reg = (raw_row_low & 0xFFFF) | ((raw_row_high & 0xFFFF) << 16);
-        }
-        else
-        {
-            metadata_reg = (raw_row_low >> 16) | (raw_row_high & 0xFFFF0000);
-        } 
+    uint32_t smemAint = static_cast<uint32_t>(__cvta_generic_to_shared(smemA + (idx / 16) * 8 + (idx % 16) * 16));
+    
+    uint32_t smemBint = static_cast<uint32_t>(__cvta_generic_to_shared(smemB + idx * 8));
 
-        __syncthreads();   // be sure all threads write the values smem
+    asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(A_mat_regs[0]), "=r"(A_mat_regs[1]), "=r"(A_mat_regs[2]), "=r"(A_mat_regs[3])
+        :  "r"(smemAint));
 
-        uint32_t smemAint = static_cast<uint32_t>(__cvta_generic_to_shared(smemA + (idx / 16) * 8 + (idx % 16) * 16));
-        
-        uint32_t smemBint = static_cast<uint32_t>(__cvta_generic_to_shared(smemB + idx * 8));
-
-        asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(A_mat_regs[0]), "=r"(A_mat_regs[1]), "=r"(A_mat_regs[2]), "=r"(A_mat_regs[3])
-            :  "r"(smemAint));
-
-        asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.trans.b16 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(B_mat_regs[0]), "=r"(B_mat_regs[1]), "=r"(B_mat_regs[2]), "=r"(B_mat_regs[3])
-            :  "r"(smemBint));
+    asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.trans.b16 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(B_mat_regs[0]), "=r"(B_mat_regs[1]), "=r"(B_mat_regs[2]), "=r"(B_mat_regs[3])
+        :  "r"(smemBint));
 
 
-        asm volatile(
-            "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
-            "{%0, %1, %2, %3}, "      
-            "{%4, %5, %6, %7}, "      
-            "{%8, %9, %10, %11}, "    
-            "{%12, %13, %14, %15}, "  
-            "%16, 0x0;\n"             
-            : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
-            : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
-            "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
-            "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
-            "r"(metadata_reg)
-            );
+    asm volatile(
+        "mma.sp::ordered_metadata.sync.aligned.m16n8k32.row.col.f32.bf16.bf16.f32 "
+        "{%0, %1, %2, %3}, "      
+        "{%4, %5, %6, %7}, "      
+        "{%8, %9, %10, %11}, "    
+        "{%12, %13, %14, %15}, "  
+        "%16, 0x0;\n"             
+        : "=f"(C_mat_regs[0]), "=f"(C_mat_regs[1]), "=f"(C_mat_regs[2]), "=f"(C_mat_regs[3])
+        : "r"(A_mat_regs[0]), "r"(A_mat_regs[1]), "r"(A_mat_regs[2]), "r"(A_mat_regs[3]),
+        "r"(B_mat_regs[0]), "r"(B_mat_regs[1]), "r"(B_mat_regs[2]), "r"(B_mat_regs[3]),
+        "f"(C_mat_regs[0]), "f"(C_mat_regs[1]), "f"(C_mat_regs[2]), "f"(C_mat_regs[3]),
+        "r"(metadata_reg)
+        );
 
-        float *thStartC = C + (idx % 4) * 2 + (idx / 4) * 8;
+    float *thStartC = C + (idx % 4) * 2 + (idx / 4) * 8;
 
-        thStartC[0] = C_mat_regs[0];
-        thStartC[1] = C_mat_regs[1];
-        thStartC[64] = C_mat_regs[2];
-        thStartC[65] = C_mat_regs[3];
+    thStartC[0] = C_mat_regs[0];
+    thStartC[1] = C_mat_regs[1];
+    thStartC[64] = C_mat_regs[2];
+    thStartC[65] = C_mat_regs[3];
+
+    asm volatile ("" ::: "memory");
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        end_clock = clock64();
+        *d_cycles = *d_cycles + (end_clock - start_clock);
     }
 }
 
@@ -356,6 +406,8 @@ void cpu_gemm(const bfloat16_t* A, const bfloat16_t* B, float* C,
         }
     }
 }
+
+const double GPU_FREQ_GHZ = 1.50; 
 
 // --- HELPER FUNCTION: RESULT VERIFICATION ---
 bool verify_result(float* d_C, const std::vector<float>& h_C_Ref, int M, int N) {
@@ -386,7 +438,7 @@ bool verify_result(float* d_C, const std::vector<float>& h_C_Ref, int M, int N) 
     }
 }
 
-// --- BENCHMARK FUNCTION ---
+// --- BENCHMARK FUNCTION (UPDATED FOR CLOCK64) ---
 template <typename KernelFunc>
 void run_benchmark(const char* kernel_name, KernelFunc kernel, 
                    bfloat16_t* d_A, bfloat16_t* d_B, float* d_C, int32_t* d_Meta, 
@@ -395,26 +447,26 @@ void run_benchmark(const char* kernel_name, KernelFunc kernel,
     printf("\n=======================================================\n");
     printf("TEST: %s\n", kernel_name);
     printf("=======================================================\n");
-
-    // SETTINGS
-    // kernel_loops: How many times the matrix multiplication runs INSIDE the GPU kernel.
-    // This increases Arithmetic Intensity and hides launch latency.
-    int kernel_loops = 500000; 
     
-    // measure_iters: How many times we launch the kernel from Host.
-    // Since the kernel is now heavy, we can reduce this number.
-    int warmup_iters = 10;
-    int measure_iters = 100;
+    // Cycle sayacı için bellek ayır
+    long long* d_cycles;
+    cudaMalloc(&d_cycles, sizeof(long long));
+    cudaMemset(d_cycles, 0, sizeof(long long)); // Temizle
+
+    // measure_iters: Launch overhead çok yüksek olduğu için 5 milyon yeterli.
+    int warmup_iters = 10000;
+    int measure_iters = 5000000;
 
     // 1. VERIFICATION
-    // We run the kernel with loop_count = 1 just to check correctness.
+    // Kernel<<<1, 32>>> çağırıyoruz (Bu dosya için 1 Warp yeterli)
     cudaMemset(d_C, 0, M * N * sizeof(float)); 
-    kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, 1);  
+    kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, d_cycles);  
     cudaDeviceSynchronize();
     
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("  [CUDA ERROR] Kernel launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_cycles);
         return;
     }
 
@@ -424,19 +476,25 @@ void run_benchmark(const char* kernel_name, KernelFunc kernel,
 
     // 2. WARMUP
     for(int i=0; i<warmup_iters; i++) {
-        kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, kernel_loops);
+        kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, d_cycles);
     }
     cudaDeviceSynchronize();
 
+    // *** KRİTİK ADIM ***
+    // Ölçüm öncesi sayacı SIFIRLIYORUZ.
+    cudaMemset(d_cycles, 0, sizeof(long long));
+
     // 3. PERFORMANCE BENCHMARK
+    printf("  -> Running %d iterations...\n", measure_iters);
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
     for(int i=0; i<measure_iters; i++) {
-        // Launch kernel with heavy workload
-        kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, kernel_loops);
+        // Kernel d_cycles üzerine toplama (accumulation) yapacak
+        kernel<<<1, 32>>>(d_A, d_B, d_C, d_Meta, d_cycles);
     }
     cudaEventRecord(stop);
     
@@ -444,20 +502,40 @@ void run_benchmark(const char* kernel_name, KernelFunc kernel,
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
 
-    // Metrics Calculation
+    // --- HOST SIDE METRICS (Launch Overhead Dahil) ---
     double avg_time_sec = (milliseconds / 1000.0) / measure_iters;
     
-    // GFLOPS Calculation:
-    // Formula: (2 * M * N * K) * (Operations inside Kernel)
-    double total_flops_per_launch = 2.0 * (double)M * (double)N * (double)K * (double)kernel_loops;
-    double gflops = (total_flops_per_launch * 1e-9) / avg_time_sec;
+    // GFLOPS Formula: (2 * M * N * K)
+    double total_flops_per_launch = 2.0 * (double)M * (double)N * (double)K;
+    double gflops_host = (total_flops_per_launch * 1e-9) / avg_time_sec;
 
-    printf("  -> Kernel Loops   : %d\n", kernel_loops);
-    printf("  -> Duration (Avg) : %.6f ms\n", milliseconds / measure_iters);
-    printf("  -> Performance    : %.4f GFLOPS\n", gflops);
+    // --- DEVICE SIDE METRICS (Saf Donanım Hızı) ---
+    long long total_cycles = 0;
+    cudaMemcpy(&total_cycles, d_cycles, sizeof(long long), cudaMemcpyDeviceToHost);
+
+    double avg_cycles = (double)total_cycles / measure_iters;
+    double hardware_latency_ns = avg_cycles / GPU_FREQ_GHZ;
+    
+    // GFLOPS (Hardware): Launch overhead olmadan teorik hız
+    double gflops_hardware = (total_flops_per_launch * 1e-9) / (hardware_latency_ns * 1e-9);
+
+    printf("\n  [HOST TIMER - Includes Overhead]\n");
+    printf("  -> Duration (Avg)  : %.6f ms (%.2f ns)\n", milliseconds / measure_iters, avg_time_sec * 1e9);
+    printf("  -> Performance     : %.4f GFLOPS\n", gflops_host);
+
+    printf("\n  [DEVICE CLOCK64 - Execution Only]\n");
+    printf("  -> Avg Cycles      : %.2f cycles\n", avg_cycles);
+    printf("  -> Hardware Latency: %.2f ns (assuming %.2f GHz)\n", hardware_latency_ns, GPU_FREQ_GHZ);
+    printf("  -> Core Perf.      : %.4f GFLOPS (Theoretical Peak)\n", gflops_hardware);
+
+    printf("\n  [OVERHEAD ANALYSIS]\n");
+    double overhead_ns = (avg_time_sec * 1e9) - hardware_latency_ns;
+    printf("  -> Launch Overhead : %.2f ns per kernel (%.2f%% of total time)\n", 
+           overhead_ns, (overhead_ns / (avg_time_sec * 1e9)) * 100.0);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    cudaFree(d_cycles);
 }
 
 int main() 
@@ -517,6 +595,7 @@ int main()
     cudaMemcpy(d_Metadata, h_Metadata.data(), size_Metadata * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     // --- 4. RUN BENCHMARK ---
+    // Kernel parametreleri run_benchmark içinde d_cycles eklenerek çağrılıyor.
 
     // Test 1: Only Global Memory
     run_benchmark("1. Global Memory Access Only", 
