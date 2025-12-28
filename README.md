@@ -36,12 +36,17 @@ A key finding of this project is the dominance of **Kernel Launch Overhead** in 
 ### 📉 Scenario 1: Small Workload (One Warp)
 *Configuration: 1 Warp (32 Threads) | Matrix: $16\times8\times32$*
 
-**Results (Hardware Cycles - Lower is Better):**
+#### 1. Warp Layout Strategy
+The figure below illustrates how the single warp is mapped to the A, B, and C matrices. Since the workload fits into a single Tensor Core operation, no tiling loop is required.
+
+![One Warp Layout](assets/OneWarpTensorCoreWarpLayout.png)
+
+#### 2. Performance Results (Hardware Cycles - Lower is Better)
 * **Global Memory:** ~465 Cycles 🏆
 * **Shared Memory + `ldmatrix`:** ~470 Cycles
 * **Manual Shared Memory:** ~502 Cycles
 
-![One Warp Result](OneWarpSparseMatMulCompare.png)
+![One Warp Result](assets/OneWarpSparseMatMulCompare.png)
 
 #### 💡 Analysis: The "L1 Efficiency" Zone
 In this smallest workload, **Global Memory is the winner.**
@@ -54,12 +59,17 @@ In this smallest workload, **Global Memory is the winner.**
 ### 📉 Scenario 2: Transition Zone (Four Warps)
 *Configuration: 4 Warps (128 Threads) | Matrix: $32\times16\times32$*
 
-**Results (Hardware Cycles):**
+#### 1. Warp Layout Strategy
+To handle the larger dimensions, we distribute the workload across 4 Warps. Warps 0-3 are assigned to cover the output matrix C in a tiled manner, requiring synchronized data loading.
+
+![Four Warp Layout](assets/FourWarpTensorCoreWarpLayout.png)
+
+#### 2. Performance Results (Hardware Cycles)
 * **Global Memory:** ~554 Cycles
 * **Shared Memory + `ldmatrix`:** ~555 Cycles
 * **Manual Shared Memory:** ~600 Cycles
 
-![Four Warp Result](FourWarpSparseMatMulCompare.png)
+![Four Warp Result](assets/FourWarpSparseMatMulCompare.png)
 
 #### 💡 Analysis: The Equilibrium
 This scenario represents the **tipping point**.
@@ -71,12 +81,17 @@ This scenario represents the **tipping point**.
 ### 🚀 Scenario 3: The Crossover (Eight Warps)
 *Configuration: 8 Warps (256 Threads) | Matrix: $32\times32\times32$*
 
-**Results (Hardware Cycles):**
+#### 1. Warp Layout Strategy
+With 256 threads active, we distribute the C matrix calculation across 8 Warps. The $32 \times 32$ output matrix is divided into 8 rectangular tiles ($16 \times 8$ each), requiring rigorous synchronization.
+
+![Eight Warp Layout](assets/EightWarpTensorCoreWarpLayout.png)
+
+#### 2. Performance Results (Hardware Cycles)
 * **Shared Memory + `ldmatrix`:** ~786 Cycles 🏆
 * **Global Memory:** ~904 Cycles
 * **Manual Shared Memory:** ~978 Cycles
 
-![Eight Warp Result](EightWarpSparseMatMulCompare.png)
+![Eight Warp Result](assets/EightWarpSparseMatMulCompare.png)
 
 #### 💡 Analysis: Hardware Acceleration Wins
 Here, the leadership changes hands. **`ldmatrix` becomes the clear winner (~15% faster).**
